@@ -1,5 +1,24 @@
 # javaperf
 
+> **JetDesk vendored fork.** This copy lives under `tools/mcp/javaperf/` in the
+> support-toolkit and is built locally via `scripts/setup/setup-javaperf.js`
+> (no `npx` / `npm install -g` needed). For the JetDesk-facing workflow + tool
+> reference, see `.claude/skills/analyze/references/snapshot-backend.md`.
+>
+> The fork adds 8 IDE-bridge-aware tools (`profile_describe_snapshot`,
+> `profile_env`, `profile_heap_health`, `profile_list_threads`,
+> `profile_per_thread`, `profile_call_tree`, `profile_edt_hotspot`,
+> `profile_subsystem_scan`) that auto-discover a JetBrains IDE reachable via
+> mcp-steroid and delegate to the IDE's already-parsed Profiler model for
+> high-fidelity views; they fall back to a clear `BRIDGE_REQUIRED` error
+> when no IDE is reachable. The legacy upstream tools below work unchanged
+> headless via raw `jfr` CLI.
+>
+> The rest of this README is the upstream documentation, preserved verbatim
+> to keep fork diff small for a future upstream PR.
+
+---
+
 [![npm version](https://img.shields.io/npm/v/javaperf.svg)](https://www.npmjs.com/package/javaperf)
 
 > MCP (Model Context Protocol) server for profiling Java applications via JDK utilities (jcmd, jfr, jps)

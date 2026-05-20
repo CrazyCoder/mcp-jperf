@@ -1,5 +1,17 @@
 # AGENTS.md
 
+> **JetDesk vendored fork.** Built locally via `scripts/setup/setup-javaperf.js`
+> in the parent support-toolkit (npm install + tsc, idempotent on source change,
+> wired into `post-pull-maintenance.js`). For the JetDesk-facing workflow + the
+> 8 IDE-bridge-aware tools this fork adds, see
+> `.claude/skills/analyze/references/snapshot-backend.md`. The bridge loader at
+> `src/utils/ide-bridge.ts` dynamically imports `scripts/lib/ide-bridge.js`
+> from the parent toolkit when the vendored relative path is present; absent
+> → the bridge tools return `BRIDGE_REQUIRED`. The rest of this file is the
+> upstream AGENTS.md.
+
+---
+
 ## Cursor Cloud specific instructions
 
 ### Overview
