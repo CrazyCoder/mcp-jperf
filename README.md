@@ -10,9 +10,12 @@
 > `profile_per_thread`, `profile_call_tree`, `profile_edt_hotspot`,
 > `profile_subsystem_scan`) that auto-discover a JetBrains IDE reachable via
 > mcp-steroid and delegate to the IDE's already-parsed Profiler model for
-> high-fidelity views; they fall back to a clear `BRIDGE_REQUIRED` error
-> when no IDE is reachable. The legacy upstream tools below work unchanged
-> headless via raw `jfr` CLI.
+> high-fidelity views. When no IDE is reachable they fall back to a `jfr`
+> CLI path (`source: "jfr-cli"`, `metric: "samples"`) — same output shape,
+> sample-count fidelity. The tree modes of `profile_call_tree`
+> (`hierarchical` / `callees` / `backtrace`) still return `BRIDGE_REQUIRED`
+> in CLI mode; `mode="flat"` works headless. The legacy upstream tools
+> below work unchanged headless via raw `jfr` CLI.
 >
 > The rest of this README is the upstream documentation, preserved verbatim
 > to keep fork diff small for a future upstream PR.

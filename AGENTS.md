@@ -6,9 +6,12 @@
 > 8 IDE-bridge-aware tools this fork adds, see
 > `.claude/skills/analyze/references/snapshot-backend.md`. The bridge loader at
 > `src/utils/ide-bridge.ts` dynamically imports `scripts/lib/ide-bridge.js`
-> from the parent toolkit when the vendored relative path is present; absent
-> → the bridge tools return `BRIDGE_REQUIRED`. The rest of this file is the
-> upstream AGENTS.md.
+> from the parent toolkit when the vendored relative path is present. When
+> the bridge is absent or no IDE is reachable, the tools degrade to a `jfr`
+> CLI fallback (`source: "jfr-cli"`, `metric: "samples"`) — same field shapes
+> as bridge mode, sample-count fidelity. `profile_call_tree`'s tree modes
+> (`hierarchical`/`callees`/`backtrace`) remain bridge-only; flat mode works
+> headless. The rest of this file is the upstream AGENTS.md.
 
 ---
 
