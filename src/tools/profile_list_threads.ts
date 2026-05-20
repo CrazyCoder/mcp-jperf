@@ -3,6 +3,14 @@ import { existsSync } from "node:fs";
 import { resolveProfilePath } from "../utils/paths.js";
 import { formatError } from "../utils/errors.js";
 import { getIdeBridge } from "../utils/ide-bridge.js";
+import {
+  buildPerThreadTrees,
+  classifyThreadGroup,
+  DEFAULT_WALL_CLOCK_EVENTS,
+  runJfrTextSamples,
+  type RawSampleEvent,
+  type SynthCallNode,
+} from "../utils/jfr-cli-aggregator.js";
 
 export const profileListThreadsSchema = z.object({
   filepath: z
@@ -14,7 +22,7 @@ export const profileListThreadsSchema = z.object({
     .enum(["wallClockCpu", "wallClockTotal", "cpu", "memoryAllocations"])
     .optional()
     .default("wallClockCpu")
-    .describe("Which tree's per-thread sample totals to use for ranking. Default wallClockCpu."),
+    .describe("Which tree's per-thread sample totals to use for ranking. Default wallClockCpu. CLI mode ignores this and uses raw sample counts."),
   topN: z
     .number()
     .int()
@@ -28,18 +36,17 @@ export const profileListThreadsSchema = z.object({
 export type ProfileListThreadsInput = z.infer<typeof profileListThreadsSchema>;
 
 /**
- * Fast thread inventory for an open snapshot. Returns:
+ * Fast thread inventory. Returns:
  *   - groupSummary: per-group thread count + total samples + % of total
  *     (edt, idePool, dispatcher, fjPool, indexing, telemetry, gc, other)
  *   - threads: top-N threads by sample count, each with its hottest-leaf frame
  *     (the deepest method along the hottest-child chain — a one-line summary
  *     of what the thread was actually doing).
  *
- * Cheap first-look tool: ~1-2s on a typical snapshot, no deep aggregation.
- * Use to identify which threads are worth drilling into with profile_per_thread
- * or profile_call_tree.
- *
- * Bridge-only: requires a JetBrains IDE reachable via mcp-steroid.
+ * Bridge mode (IDE reachable): uses the IDE's already-parsed call tree (state-
+ * aware, wall-clock-interval-scaled). Metric = wallClockMs|bytes|samples.
+ * CLI fallback: synthesizes a per-thread tree from streamed JFR samples.
+ * Metric = samples; numbers differ from bridge mode but ranking is similar.
  */
 export async function profileListThreads(input: ProfileListThreadsInput): Promise<string> {
   const filepath = resolveProfilePath(input.filepath);
@@ -52,40 +59,121 @@ export async function profileListThreads(input: ProfileListThreadsInput): Promis
   }
 
   const ide = await getIdeBridge();
-  if (!ide) {
-    return formatError(
-      "profile_list_threads requires the JetDesk IDE bridge.",
-      "BRIDGE_REQUIRED",
-      "This tool needs a running JetBrains IDE reachable via mcp-steroid.",
-    );
+  if (ide) {
+    try {
+      const { open, result } = await ide.runner.runSnapshotScript(
+        ide.bridge,
+        "extract-list-threads.kts",
+        filepath,
+        {
+          treeId: input.treeId,
+          topN: String(input.topN),
+        },
+        { taskId: "javaperf:profile_list_threads", reason: `profile_list_threads on ${filepath}` },
+      );
+      return JSON.stringify(
+        {
+          source: "ide-bridge",
+          ide: { name: ide.bridge.ideName, build: ide.bridge.ideBuild, project: ide.bridge.projectName },
+          snapshot: { state: (open as { state?: string })?.state, file: filepath },
+          ...(result as object),
+        },
+        null,
+        2,
+      );
+    } catch (err) {
+      return formatError(
+        `IDE bridge call failed: ${(err as Error).message}`,
+        "BRIDGE_ERROR",
+        "Open the .jfr in the IntelliJ Profiler tool window manually, then retry.",
+      );
+    }
   }
 
   try {
-    const { open, result } = await ide.runner.runSnapshotScript(
-      ide.bridge,
-      "extract-list-threads.kts",
-      filepath,
-      {
-        treeId: input.treeId,
-        topN: String(input.topN),
-      },
-      { taskId: "javaperf:profile_list_threads", reason: `profile_list_threads on ${filepath}` },
-    );
-    return JSON.stringify(
-      {
-        source: "ide-bridge",
-        ide: { name: ide.bridge.ideName, build: ide.bridge.ideBuild, project: ide.bridge.projectName },
-        snapshot: { state: (open as { state?: string })?.state, file: filepath },
-        ...(result as object),
-      },
-      null,
-      2,
-    );
+    const out = await computeListThreadsCli(filepath, input.topN);
+    return JSON.stringify({ source: "jfr-cli", snapshot: { file: filepath }, ...out }, null, 2);
   } catch (err) {
     return formatError(
-      `IDE bridge call failed: ${(err as Error).message}`,
-      "BRIDGE_ERROR",
-      "Open the .jfr in the IntelliJ Profiler tool window manually, then retry.",
+      `jfr CLI failed: ${(err as Error).message}`,
+      "JFR_CLI_ERROR",
+      "Check that JAVA_HOME points to a JDK 9+ with bin/jfr.",
     );
   }
+}
+
+async function computeListThreadsCli(filepath: string, topN: number): Promise<Record<string, unknown>> {
+  // We need both per-thread sample counts (cheap) and the hottest-leaf chain
+  // (requires the synthesized tree). One streaming pass that builds both.
+  const events: RawSampleEvent[] = [];
+  const { eventCount } = await runJfrTextSamples(filepath, DEFAULT_WALL_CLOCK_EVENTS, 64, (ev) => {
+    events.push(ev);
+  });
+  void eventCount;
+
+  const trees = buildPerThreadTrees(events);
+  let totalSamples = 0;
+  const groupTotals = new Map<string, number>();
+  const groupCounts = new Map<string, number>();
+
+  interface Row {
+    name: string;
+    group: string;
+    samples: number;
+    hottestLeaf: string | null;
+  }
+  const rows: Row[] = [];
+  for (const [name, root] of trees) {
+    const samples = root.value;
+    const group = classifyThreadGroup(name);
+    rows.push({ name, group, samples, hottestLeaf: hottestLeafChain(root) });
+    totalSamples += samples;
+    groupTotals.set(group, (groupTotals.get(group) ?? 0) + samples);
+    groupCounts.set(group, (groupCounts.get(group) ?? 0) + 1);
+  }
+
+  rows.sort((a, b) => b.samples - a.samples);
+
+  const groupSummary = [...groupTotals.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([group, samples]) => ({
+      group,
+      threadCount: groupCounts.get(group) ?? 0,
+      value: samples,
+      pctOfTotal: totalSamples > 0 ? +(samples / totalSamples * 100).toFixed(2) : 0,
+    }));
+
+  const threads = rows.slice(0, topN).map((r) => ({
+    name: r.name,
+    group: r.group,
+    value: r.samples,
+    pctOfTotal: totalSamples > 0 ? +(r.samples / totalSamples * 100).toFixed(2) : 0,
+    hottestLeaf: r.hottestLeaf,
+  }));
+
+  return {
+    treeId: null,
+    metric: "samples",
+    totalThreadsInSnapshot: trees.size,
+    totalValue: totalSamples,
+    groupSummary,
+    threads,
+  };
+}
+
+/** Walk hottest child until a single branch no longer dominates (or runs out). */
+function hottestLeafChain(node: SynthCallNode): string | null {
+  let cur: SynthCallNode = node;
+  let last: string | null = null;
+  let guard = 0;
+  while (guard++ < 200) {
+    let best: SynthCallNode | null = null;
+    for (const c of cur.children.values()) {
+      if (!best || c.value > best.value) best = c;
+    }
+    if (!best) return last;
+    if (best.frame) last = best.frame;
+    cur = best;
+  }
+  return last;
 }

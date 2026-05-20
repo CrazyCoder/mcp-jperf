@@ -3,6 +3,15 @@ import { existsSync } from "node:fs";
 import { resolveProfilePath } from "../utils/paths.js";
 import { formatError } from "../utils/errors.js";
 import { getIdeBridge } from "../utils/ide-bridge.js";
+import {
+  buildPerThreadTrees,
+  classifyThreadGroup,
+  DEFAULT_WALL_CLOCK_EVENTS,
+  runJfrTextSamples,
+  selfValueOf,
+  type RawSampleEvent,
+  type SynthCallNode,
+} from "../utils/jfr-cli-aggregator.js";
 
 export const profilePerThreadSchema = z.object({
   filepath: z
@@ -37,13 +46,14 @@ export type ProfilePerThreadInput = z.infer<typeof profilePerThreadSchema>;
  * dispatcher / fjPool / indexing / telemetry / gc / other; each group reports
  * its hot inclusive frames (anywhere in stack) and leaf frames (self time).
  *
- * High-fidelity path (when a JetBrains IDE with the Profiler Ultimate plugin is
- * reachable via the JetDesk IDE bridge): delegates to extract-per-thread.kts,
- * which reads the IDE's already-parsed call tree (state-aware, wall-clock-
- * interval-scaled, JBR-aware).
+ * Bridge mode (IDE reachable): delegates to extract-per-thread.kts, which
+ * reads the IDE's already-parsed call tree (state-aware, wall-clock-interval-
+ * scaled, JBR-aware). Metric = wallClockMs|bytes|samples.
  *
- * Local-CLI fallback: not implemented yet — returns a structured error pointing
- * at the bridge requirement and the existing flat-aggregate tools.
+ * CLI fallback: synthesizes per-thread trees from streamed JFR samples and
+ * aggregates inclusive + leaf frame counts per group. Metric = samples; numbers
+ * differ from bridge mode but group ranking is similar. `treeId` is ignored
+ * in CLI mode.
  */
 export async function profilePerThread(input: ProfilePerThreadInput): Promise<string> {
   const filepath = resolveProfilePath(input.filepath);
@@ -88,9 +98,101 @@ export async function profilePerThread(input: ProfilePerThreadInput): Promise<st
     }
   }
 
-  return formatError(
-    "profile_per_thread requires the JetDesk IDE bridge.",
-    "BRIDGE_REQUIRED",
-    "This tool needs a running JetBrains IDE reachable via mcp-steroid. For raw flat aggregation, use profile_time (cumulative) or profile_frequency (leaf) instead.",
-  );
+  try {
+    const out = await computePerThreadCli(filepath, input.threadFilter, input.topN);
+    return JSON.stringify({ source: "jfr-cli", snapshot: { file: filepath }, ...out }, null, 2);
+  } catch (err) {
+    return formatError(
+      `jfr CLI failed: ${(err as Error).message}`,
+      "JFR_CLI_ERROR",
+      "Check that JAVA_HOME points to a JDK 9+ with bin/jfr.",
+    );
+  }
+}
+
+function globToRegex(pattern: string): RegExp | null {
+  if (pattern === "*") return null;
+  const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
+  return new RegExp(`^${escaped}$`);
+}
+
+async function computePerThreadCli(
+  filepath: string,
+  threadFilter: string,
+  topN: number,
+): Promise<Record<string, unknown>> {
+  const events: RawSampleEvent[] = [];
+  await runJfrTextSamples(filepath, DEFAULT_WALL_CLOCK_EVENTS, 64, (ev) => {
+    events.push(ev);
+  });
+  const trees = buildPerThreadTrees(events);
+
+  const filterRe = globToRegex(threadFilter);
+  const groupLeaf = new Map<string, Map<string, number>>();
+  const groupInclusive = new Map<string, Map<string, number>>();
+  const threadCountByGroup = new Map<string, number>();
+  const groupSamples = new Map<string, number>();
+  const matchedThreads: string[] = [];
+
+  for (const [name, root] of trees) {
+    if (filterRe && !filterRe.test(name)) continue;
+    matchedThreads.push(name);
+    const group = classifyThreadGroup(name);
+    threadCountByGroup.set(group, (threadCountByGroup.get(group) ?? 0) + 1);
+    groupSamples.set(group, (groupSamples.get(group) ?? 0) + root.value);
+
+    let leaf = groupLeaf.get(group);
+    if (!leaf) {
+      leaf = new Map();
+      groupLeaf.set(group, leaf);
+    }
+    let incl = groupInclusive.get(group);
+    if (!incl) {
+      incl = new Map();
+      groupInclusive.set(group, incl);
+    }
+
+    // Walk every node under the thread root. Inclusive = node.value; leaf = selfValueOf(node).
+    const stack: SynthCallNode[] = [...root.children.values()];
+    while (stack.length) {
+      const n = stack.pop()!;
+      if (!n.frame) continue;
+      incl.set(n.frame, (incl.get(n.frame) ?? 0) + n.value);
+      const s = selfValueOf(n);
+      if (s > 0) leaf.set(n.frame, (leaf.get(n.frame) ?? 0) + s);
+      for (const c of n.children.values()) stack.push(c);
+    }
+  }
+
+  const orderedGroups = [...groupSamples.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([g]) => g);
+  const groupsOut: Record<string, unknown> = {};
+  for (const g of orderedGroups) {
+    const total = groupSamples.get(g) ?? 0;
+    const inclusive = [...(groupInclusive.get(g) ?? new Map()).entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, topN)
+      .map(([method, value]) => ({ method, value }));
+    const leaf = [...(groupLeaf.get(g) ?? new Map()).entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, topN)
+      .map(([method, value]) => ({ method, value }));
+    groupsOut[g] = {
+      threadCount: threadCountByGroup.get(g) ?? 0,
+      totalValue: total,
+      inclusive,
+      leaf,
+    };
+  }
+
+  return {
+    treeId: null,
+    metric: "samples",
+    totalThreadsInSnapshot: trees.size,
+    matchedThreadCount: matchedThreads.length,
+    matchedThreadSample: matchedThreads.slice(0, 8),
+    groupsSortedByValue: orderedGroups,
+    groups: groupsOut,
+  };
 }

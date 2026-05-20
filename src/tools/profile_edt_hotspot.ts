@@ -3,6 +3,14 @@ import { existsSync } from "node:fs";
 import { resolveProfilePath } from "../utils/paths.js";
 import { formatError } from "../utils/errors.js";
 import { getIdeBridge } from "../utils/ide-bridge.js";
+import {
+  buildPerThreadTrees,
+  DEFAULT_WALL_CLOCK_EVENTS,
+  runJfrTextSamples,
+  selfValueOf,
+  type RawSampleEvent,
+  type SynthCallNode,
+} from "../utils/jfr-cli-aggregator.js";
 
 export const profileEdtHotspotSchema = z.object({
   filepath: z
@@ -34,7 +42,10 @@ export type ProfileEdtHotspotInput = z.infer<typeof profileEdtHotspotSchema>;
  *     parent). Best for "what is the EDT actually doing during this freeze?"
  *   - leaves: top-N self-time frames across all EDT threads (exclusive hot spots).
  *
- * Bridge-only: requires a JetBrains IDE reachable via mcp-steroid.
+ * Bridge mode (IDE reachable): uses the IDE's already-parsed call tree.
+ * Metric = wallClockMs|bytes|samples.
+ * CLI fallback: synthesizes EDT-thread trees from streamed samples and walks
+ * the hottest-child chain the same way. Metric = samples.
  */
 export async function profileEdtHotspot(input: ProfileEdtHotspotInput): Promise<string> {
   const filepath = resolveProfilePath(input.filepath);
@@ -47,40 +58,128 @@ export async function profileEdtHotspot(input: ProfileEdtHotspotInput): Promise<
   }
 
   const ide = await getIdeBridge();
-  if (!ide) {
-    return formatError(
-      "profile_edt_hotspot requires the JetDesk IDE bridge.",
-      "BRIDGE_REQUIRED",
-      "This tool needs a running JetBrains IDE reachable via mcp-steroid. As a substitute, run profile_per_thread with threadFilter='AWT-EventQueue*' for a less focused EDT view.",
-    );
+  if (ide) {
+    try {
+      const { open, result } = await ide.runner.runSnapshotScript(
+        ide.bridge,
+        "extract-edt-hotspots.kts",
+        filepath,
+        {
+          topN: String(input.topN),
+          treeId: input.treeId,
+        },
+        { taskId: "javaperf:profile_edt_hotspot", reason: `profile_edt_hotspot on ${filepath}` },
+      );
+      return JSON.stringify(
+        {
+          source: "ide-bridge",
+          ide: { name: ide.bridge.ideName, build: ide.bridge.ideBuild, project: ide.bridge.projectName },
+          snapshot: { state: (open as { state?: string })?.state, file: filepath },
+          ...(result as object),
+        },
+        null,
+        2,
+      );
+    } catch (err) {
+      return formatError(
+        `IDE bridge call failed: ${(err as Error).message}`,
+        "BRIDGE_ERROR",
+        "Open the .jfr in the IntelliJ Profiler tool window manually, then retry.",
+      );
+    }
   }
 
   try {
-    const { open, result } = await ide.runner.runSnapshotScript(
-      ide.bridge,
-      "extract-edt-hotspots.kts",
-      filepath,
-      {
-        topN: String(input.topN),
-        treeId: input.treeId,
-      },
-      { taskId: "javaperf:profile_edt_hotspot", reason: `profile_edt_hotspot on ${filepath}` },
-    );
-    return JSON.stringify(
-      {
-        source: "ide-bridge",
-        ide: { name: ide.bridge.ideName, build: ide.bridge.ideBuild, project: ide.bridge.projectName },
-        snapshot: { state: (open as { state?: string })?.state, file: filepath },
-        ...(result as object),
-      },
-      null,
-      2,
-    );
+    const out = await computeEdtCli(filepath, input.topN);
+    return JSON.stringify({ source: "jfr-cli", snapshot: { file: filepath }, ...out }, null, 2);
   } catch (err) {
     return formatError(
-      `IDE bridge call failed: ${(err as Error).message}`,
-      "BRIDGE_ERROR",
-      "Open the .jfr in the IntelliJ Profiler tool window manually, then retry.",
+      `jfr CLI failed: ${(err as Error).message}`,
+      "JFR_CLI_ERROR",
+      "Check that JAVA_HOME points to a JDK 9+ with bin/jfr.",
     );
   }
+}
+
+async function computeEdtCli(filepath: string, topN: number): Promise<Record<string, unknown>> {
+  const events: RawSampleEvent[] = [];
+  await runJfrTextSamples(filepath, DEFAULT_WALL_CLOCK_EVENTS, 64, (ev) => {
+    events.push(ev);
+  });
+  const trees = buildPerThreadTrees(events);
+  const edtEntries: Array<[string, SynthCallNode]> = [];
+  for (const [name, root] of trees) {
+    if (name.startsWith("AWT-EventQueue")) edtEntries.push([name, root]);
+  }
+  if (edtEntries.length === 0) {
+    return {
+      treeId: null,
+      metric: "samples",
+      error: "No AWT-EventQueue threads in snapshot",
+      threadsInSnapshot: trees.size,
+    };
+  }
+
+  const edtThreadNames = edtEntries.map(([n]) => n);
+  const totalEdtSamples = edtEntries.reduce((acc, [, r]) => acc + r.value, 0);
+
+  // Hierarchical hot path from the first EDT root: descend by hottest child
+  // until its share drops below 30% of parent.
+  const firstRoot = edtEntries[0][1];
+  const hotPath: Array<Record<string, unknown>> = [];
+  {
+    let node: SynthCallNode = firstRoot;
+    let depth = 0;
+    while (depth < 200) {
+      let hottest: SynthCallNode | null = null;
+      for (const c of node.children.values()) {
+        if (!hottest || c.value > hottest.value) hottest = c;
+      }
+      if (!hottest || !hottest.frame) break;
+      const parentValue = node.value;
+      const hottestValue = hottest.value;
+      hotPath.push({
+        depth,
+        method: hottest.frame,
+        value: hottestValue,
+        selfValue: selfValueOf(hottest),
+        shareOfParent: parentValue > 0 ? hottestValue / parentValue : 0,
+      });
+      depth++;
+      if (parentValue > 0 && hottestValue / parentValue < 0.3) break;
+      node = hottest;
+    }
+  }
+
+  // Flat leaf top-N across all EDT threads.
+  const leaves = new Map<string, number>();
+  for (const [, root] of edtEntries) {
+    const stack: SynthCallNode[] = [...root.children.values()];
+    while (stack.length) {
+      const n = stack.pop()!;
+      if (!n.frame) continue;
+      const s = selfValueOf(n);
+      if (s > 0) leaves.set(n.frame, (leaves.get(n.frame) ?? 0) + s);
+      for (const c of n.children.values()) stack.push(c);
+    }
+  }
+
+  const leavesOut = [...leaves.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, topN)
+    .map(([method, selfValue]) => ({
+      method,
+      selfValue,
+      pctOfEdt: totalEdtSamples > 0 ? (selfValue / totalEdtSamples) * 100 : 0,
+    }));
+
+  return {
+    treeId: null,
+    metric: "samples",
+    edtThreads: edtThreadNames,
+    totalEdtValue: totalEdtSamples,
+    totalSnapshotThreads: trees.size,
+    hotPath,
+    leaves: leavesOut,
+  };
 }
