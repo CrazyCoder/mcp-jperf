@@ -62,6 +62,11 @@ let cached: LoadResult | undefined;
  */
 export async function loadBridge(): Promise<LoadResult> {
   if (cached !== undefined) return cached;
+  // Test seam: skip bridge discovery entirely when the env flag is set.
+  if (process.env.JAVAPERF_DISABLE_BRIDGE === "1") {
+    cached = null;
+    return cached;
+  }
   if (!existsSync(BRIDGE_PATH) || !existsSync(SNAPSHOT_RUNNER_PATH)) {
     cached = null;
     return cached;
