@@ -28,6 +28,14 @@ import { gcClassStats } from "./tools/gc_class_stats.js";
 import { gcFinalizerInfo } from "./tools/gc_finalizer_info.js";
 import { compilerCodecache } from "./tools/compiler_codecache.js";
 import { compilerQueue } from "./tools/compiler_queue.js";
+import { profilePerThread, profilePerThreadSchema } from "./tools/profile_per_thread.js";
+import { profileCallTree, profileCallTreeSchema } from "./tools/profile_call_tree.js";
+import { profileEdtHotspot, profileEdtHotspotSchema } from "./tools/profile_edt_hotspot.js";
+import { profileSubsystemScan, profileSubsystemScanSchema } from "./tools/profile_subsystem_scan.js";
+import { profileListThreads, profileListThreadsSchema } from "./tools/profile_list_threads.js";
+import { profileDescribeSnapshot, profileDescribeSnapshotSchema } from "./tools/profile_describe_snapshot.js";
+import { profileHeapHealth, profileHeapHealthSchema } from "./tools/profile_heap_health.js";
+import { profileEnv, profileEnvSchema } from "./tools/profile_env.js";
 import { VERSION } from "./version.js";
 
 const server = new McpServer({
@@ -569,6 +577,102 @@ server.registerTool(
   },
   async (args) => ({
     content: [{ type: "text", text: await compilerQueue(args) }],
+  })
+);
+
+server.registerTool(
+  "profile_per_thread",
+  {
+    description:
+      "Per-thread call tree from a .jfr file, with threads auto-grouped (edt / idePool / dispatcher / fjPool / indexing / telemetry / gc / other). Each group returns top frames both inclusive (anywhere in stack) and leaf (self time). High-fidelity mode uses the JetBrains IDE's already-parsed Profiler model via the JetDesk IDE bridge (requires mcp-steroid + a running IDE with the Profiler Ultimate plugin). Best for editor stutter / freeze triage where a single thread or thread family dominates. Response includes a top-level `metric` field (wallClockMs for wallClockCpu/wallClockTotal, bytes for memoryAllocations, samples for cpu) — the `value` / `totalValue` / `selfValue` numbers are in that unit. For memoryAllocations, leaf frames may be the ALLOCATED TYPE (e.g. 'java.awt.Component[]') rather than a code frame — the IDE injects the allocated class as a fake top frame so you see what was allocated, not where.",
+    inputSchema: profilePerThreadSchema,
+  },
+  async (args) => ({
+    content: [{ type: "text", text: await profilePerThread(args) }],
+  })
+);
+
+server.registerTool(
+  "profile_call_tree",
+  {
+    description:
+      "Multi-mode call-tree extraction from a .jfr file. Modes: 'hierarchical' (top-N tree across matched threads, optionally rooted at a method), 'flat' (aggregated list with self/total values, sortable), 'callees' (children subtree of a method), 'backtrace' (callers tree for a method, walks parent chains). Bridge-only: requires a JetBrains IDE reachable via mcp-steroid with the Profiler Ultimate plugin. Use this for deep call-graph navigation (drill into hot subtrees, find callers of a slow method, get exclusive-time leaf hotspots) — the flat tools (profile_time, profile_frequency) only return whole-stack aggregations. Response includes a top-level `metric` field (wallClockMs / bytes / samples) — the `value` / `totalValue` / `selfValue` numbers are in that unit. For memoryAllocations, frames may include the ALLOCATED TYPE injected by the IDE as a fake frame (e.g. 'java.awt.Component[]'). If the requested `treeId` is not present in the snapshot, returns `{ error, availableTrees }` listing what IS available — use profile_describe_snapshot first to learn what's recorded.",
+    inputSchema: profileCallTreeSchema,
+  },
+  async (args) => ({
+    content: [{ type: "text", text: await profileCallTree(args) }],
+  })
+);
+
+server.registerTool(
+  "profile_edt_hotspot",
+  {
+    description:
+      "EDT (AWT-EventQueue) hot path + leaf hotspots from a .jfr file. Returns a hierarchical descent following the hottest child at each step (so you see what the EDT was actually doing during a freeze) plus the top exclusive-time leaf frames. Bridge-only: requires a JetBrains IDE reachable via mcp-steroid. First-look tool for freeze / editor-stutter triage — for richer per-thread breakdown use profile_per_thread; to drill into a method use profile_call_tree mode=callees. Response includes a top-level `metric` field (wallClockMs / bytes / samples). Returns `{ error, availableTrees }` if the requested treeId isn't in the snapshot.",
+    inputSchema: profileEdtHotspotSchema,
+  },
+  async (args) => ({
+    content: [{ type: "text", text: await profileEdtHotspot(args) }],
+  })
+);
+
+server.registerTool(
+  "profile_subsystem_scan",
+  {
+    description:
+      "Auto-grouped subsystem breakdown of a .jfr file. Subsystems are derived from each frame's package prefix at `packageDepth` segments (e.g. 'com.intellij.spring', 'org.jetbrains.kotlin.idea') — no hardcoded keyword list. Stdlib/runtime excluded. Use to spot a dominant subsystem (Spring AOP processing 27%, an obscure plugin namespace at 40%) without prior hypotheses. Inclusive counting — every distinct subsystem in a stack is counted once per event. Bridge-only: requires a JetBrains IDE reachable via mcp-steroid. Response includes a top-level `metric` field (wallClockMs / bytes / samples); `inclusiveValue` is in that unit. Returns `{ error, availableTrees }` if the requested treeId isn't in the snapshot.",
+    inputSchema: profileSubsystemScanSchema,
+  },
+  async (args) => ({
+    content: [{ type: "text", text: await profileSubsystemScan(args) }],
+  })
+);
+
+server.registerTool(
+  "profile_list_threads",
+  {
+    description:
+      "Fast thread inventory for an open snapshot. Returns a group summary (edt / idePool / dispatcher / fjPool / indexing / telemetry / gc / other — count + total value + %) and the top-N threads by value with each thread's hottest-leaf frame as a one-line summary. Cheap first-look tool to identify which threads are worth drilling into with profile_per_thread or profile_call_tree. Bridge-only: requires a JetBrains IDE reachable via mcp-steroid.",
+    inputSchema: profileListThreadsSchema,
+  },
+  async (args) => ({
+    content: [{ type: "text", text: await profileListThreads(args) }],
+  })
+);
+
+server.registerTool(
+  "profile_describe_snapshot",
+  {
+    description:
+      "Discovery tool: returns which call trees the snapshot contains (wallClockCpu / wallClockTotal / cpu / memoryAllocations), each tree's metric (wallClockMs / bytes / samples), thread count per tree, and total value. Cheap first call to learn what the snapshot can answer before invoking deeper tools — a JFR captured without memory events will not list memoryAllocations, and any tool call with that treeId will then return a clean error. Bridge-only: requires a JetBrains IDE reachable via mcp-steroid.",
+    inputSchema: profileDescribeSnapshotSchema,
+  },
+  async (args) => ({
+    content: [{ type: "text", text: await profileDescribeSnapshot(args) }],
+  })
+);
+
+server.registerTool(
+  "profile_heap_health",
+  {
+    description:
+      "Heap health summary from JFR GC events: xmxMb + source, GC cadence + count, post-GC heap usage trend, latest after-GC % of xmx, CPU load avg/max, and a one-word assessment (Healthy / Moderate / High / Critical). Use to answer 'is the heap under pressure?'. Reads JFR events directly via JMC (no Profiler tool-window dependency) — faster than the call-tree tools. Bridge-only.",
+    inputSchema: profileHeapHealthSchema,
+  },
+  async (args) => ({
+    content: [{ type: "text", text: await profileHeapHealth(args) }],
+  })
+);
+
+server.registerTool(
+  "profile_env",
+  {
+    description:
+      "Snapshot env metadata: OS + display server, CPU cores, JVM info (version / vendor / JBR flag), JVM arguments (-Xmx etc), recording metadata (start time / duration), and async-profiler settings (sampling interval, wall-clock mode). Use when context about the captured environment matters — display server detection, JBR vs OpenJDK, configured heap. Reads JFR events directly via JMC. Bridge-only.",
+    inputSchema: profileEnvSchema,
+  },
+  async (args) => ({
+    content: [{ type: "text", text: await profileEnv(args) }],
   })
 );
 
