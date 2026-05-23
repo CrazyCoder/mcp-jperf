@@ -11,7 +11,11 @@
 > CLI fallback (`source: "jfr-cli"`, `metric: "samples"`) — same field shapes
 > as bridge mode, sample-count fidelity. `profile_call_tree`'s tree modes
 > (`hierarchical`/`callees`/`backtrace`) remain bridge-only; flat mode works
-> headless. The rest of this file is the upstream AGENTS.md.
+> headless. Fork sync is two-way: `sync-javaperf-fork.js` pulls upstream
+> into the vendored tree, `push-to-jetdesk-fork.js` replays local vendor
+> commits onto the fork's `jetdesk` branch — see
+> `.claude/docs/javaperf-fork-sync.md`. The rest of this file is the
+> upstream AGENTS.md.
 
 ---
 
