@@ -115,3 +115,50 @@ export function getMonitorOrPathKey(values: Record<string, unknown>, preferredKe
   }
   return undefined;
 }
+
+/**
+ * Leaf frames that mean "this thread was parked or blocked", not "this thread
+ * was burning CPU".
+ *
+ * In a wall-clock recording (the JetBrains Profiler default) `jdk.ExecutionSample`
+ * is emitted for parked threads too, so a raw leaf ranking is dominated by
+ * `__psynch_cvwait` and friends and answers the wrong question. Filtering these
+ * out turns "top methods" into "where the CPU actually went".
+ *
+ * Deliberately conservative: only frames that unambiguously denote a blocking
+ * wait. Blocking I/O is left in, since a thread stuck in a read is usually
+ * worth seeing.
+ */
+const WAIT_LEAF_FRAGMENTS = [
+  // macOS / BSD
+  "__psynch_cvwait",
+  "__psynch_mutexwait",
+  "__semwait_signal",
+  "_pthread_cond_wait",
+  "pthread_cond_timedwait",
+  // Linux
+  "epoll_wait",
+  "EpollArrayWrapper.epollWait",
+  "futex_wait",
+  // Windows
+  "WaitForSingleObject",
+  "WaitForMultipleObjects",
+  // JVM parking primitives (all platforms)
+  "Parker::park",
+  "Unsafe_Park",
+  "Unsafe.park",
+  "LockSupport.park",
+  "LockSupport.parkNanos",
+  "Thread.sleep",
+  "Object.wait",
+  "nanosleep",
+  // Clock reads issued from inside a timed park — always a wait tail, never a
+  // hotspot in its own right.
+  "__gettimeofday",
+];
+
+/** True when a leaf frame denotes a parked/blocked thread rather than CPU work. */
+export function isWaitLeaf(methodKey: string): boolean {
+  if (!methodKey) return false;
+  return WAIT_LEAF_FRAGMENTS.some((f) => methodKey.includes(f));
+}

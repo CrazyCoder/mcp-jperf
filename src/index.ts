@@ -406,6 +406,15 @@ server.registerTool(
         .optional()
         .default(10)
         .describe("Maximum number of top methods by CPU time to return. Default: 10."),
+      excludeWaitLeaves: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe(
+          "Drop samples whose leaf frame is a parked/blocked wait (__psynch_cvwait, Unsafe.park, epoll_wait, ...). " +
+          "Wall-clock recordings emit ExecutionSample for sleeping threads too, so the default ranking is dominated " +
+          "by waiting rather than CPU. Set true to see where CPU actually went."
+        ),
     }),
   },
   async (args, context) => ({
@@ -431,6 +440,15 @@ server.registerTool(
         .optional()
         .default(10)
         .describe("Maximum number of top methods by call frequency to return. Default: 10."),
+      excludeWaitLeaves: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe(
+          "Drop samples whose leaf frame is a parked/blocked wait (__psynch_cvwait, Unsafe.park, epoll_wait, ...). " +
+          "Wall-clock recordings emit ExecutionSample for sleeping threads too, so the default ranking is dominated " +
+          "by waiting rather than CPU. Set true to see where CPU actually went."
+        ),
     }),
   },
   async (args, context) => ({

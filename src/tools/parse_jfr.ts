@@ -2,7 +2,7 @@ import { z } from "zod";
 import { existsSync } from "node:fs";
 import { runJfr, streamJfrJsonEvents } from "../utils/jdk.js";
 import { resolveProfilePath } from "../utils/paths.js";
-import { getEventType, getStackTrace, getMethodKey } from "../utils/jfr-json.js";
+import { getEventType, getStackTrace, getMethodKey, getEventValues, toNumberLoose } from "../utils/jfr-json.js";
 import { formatError } from "../utils/errors.js";
 
 export const parseJfrSummarySchema = z.object({
@@ -26,6 +26,12 @@ export async function parseJfrSummary(input: ParseJfrSummaryInput, context?: unk
     "jdk.GarbageCollection",
     "jdk.JavaThreadStatistics",
     "jdk.ThreadAllocationStatistics",
+    // Not all recordings carry jdk.GarbageCollection — the JetBrains Profiler
+    // preset omits it — but the heap-summary events are emitted per collection
+    // and carry a gcId, so distinct gcIds recover the count. Without this a
+    // recording with thousands of collections reports gcEvents: 0.
+    "jdk.G1HeapSummary",
+    "jdk.GCHeapSummary",
   ];
   const eventsArg = events.join(",");
 
@@ -33,6 +39,7 @@ export async function parseJfrSummary(input: ParseJfrSummaryInput, context?: unk
 
   const methodCount: Map<string, number> = new Map();
   let gcCount = 0;
+  const gcIds = new Set<number>();
   const anomalies: string[] = [];
 
   try {
@@ -42,6 +49,10 @@ export async function parseJfrSummary(input: ParseJfrSummaryInput, context?: unk
       (ev) => {
         const typ = getEventType(ev);
         if (typ === "jdk.GarbageCollection") gcCount++;
+        if (typ === "jdk.G1HeapSummary" || typ === "jdk.GCHeapSummary") {
+          const id = toNumberLoose(getEventValues(ev).gcId);
+          if (id !== undefined) gcIds.add(id);
+        }
 
         if (typ === "jdk.ExecutionSample") {
           const frames = getStackTrace(ev)?.frames ?? [];
@@ -61,7 +72,6 @@ export async function parseJfrSummary(input: ParseJfrSummaryInput, context?: unk
       }
     );
 
-    if (gcCount > 100) anomalies.push("High GC count - possible memory pressure");
   } catch {
     // continue with summary only
   }
@@ -74,7 +84,12 @@ export async function parseJfrSummary(input: ParseJfrSummaryInput, context?: unk
   const result = {
     summary: summaryOut.trim(),
     topMethods,
-    gcStats: { gcEvents: gcCount },
+    gcStats: {
+      gcEvents: gcCount > 0 ? gcCount : gcIds.size,
+      // "GarbageCollection" = direct event count; "heapSummaryGcIds" = distinct
+      // gcIds recovered from heap-summary events when the direct event is absent.
+      source: gcCount > 0 ? "jdk.GarbageCollection" : gcIds.size > 0 ? "heapSummaryGcIds" : "none",
+    },
     anomalies: anomalies.length ? anomalies : undefined,
   };
 

@@ -2,7 +2,7 @@ import { z } from "zod";
 import { existsSync } from "node:fs";
 import { resolveProfilePath } from "../utils/paths.js";
 import { formatError } from "../utils/errors.js";
-import { getIdeBridge } from "../utils/ide-bridge.js";
+import { getIdeBridge, summarizeBridgeError } from "../utils/ide-bridge.js";
 import { runJfr } from "../utils/jdk.js";
 
 export const profileDescribeSnapshotSchema = z.object({
@@ -37,6 +37,7 @@ export async function profileDescribeSnapshot(input: ProfileDescribeSnapshotInpu
     );
   }
 
+  let bridgeError: string | undefined;
   const ide = await getIdeBridge();
   if (ide) {
     try {
@@ -59,17 +60,13 @@ export async function profileDescribeSnapshot(input: ProfileDescribeSnapshotInpu
         2,
       );
     } catch (err) {
-      return formatError(
-        `IDE bridge call failed: ${(err as Error).message}`,
-        "BRIDGE_ERROR",
-        "Open the .jfr in the IntelliJ Profiler tool window manually, then retry.",
-      );
+      bridgeError = summarizeBridgeError((err as Error).message);
     }
   }
 
   try {
     const out = await describeCli(filepath);
-    return JSON.stringify({ source: "jfr-cli", mode: "cli", snapshot: { file: filepath }, ...out }, null, 2);
+    return JSON.stringify({ source: "jfr-cli", ...(bridgeError ? { degradedFrom: "ide-bridge", bridgeError } : {}), mode: "cli", snapshot: { file: filepath }, ...out }, null, 2);
   } catch (err) {
     return formatError(
       `jfr CLI failed: ${(err as Error).message}`,

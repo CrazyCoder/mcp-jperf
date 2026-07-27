@@ -2,7 +2,7 @@ import { z } from "zod";
 import { existsSync } from "node:fs";
 import { resolveProfilePath } from "../utils/paths.js";
 import { formatError } from "../utils/errors.js";
-import { getIdeBridge } from "../utils/ide-bridge.js";
+import { getIdeBridge, summarizeBridgeError } from "../utils/ide-bridge.js";
 import {
   buildPerThreadTrees,
   DEFAULT_WALL_CLOCK_EVENTS,
@@ -112,6 +112,7 @@ export async function profileCallTree(input: ProfileCallTreeInput): Promise<stri
     );
   }
 
+  let bridgeError: string | undefined;
   const ide = await getIdeBridge();
   if (ide) {
     try {
@@ -142,25 +143,38 @@ export async function profileCallTree(input: ProfileCallTreeInput): Promise<stri
         2,
       );
     } catch (err) {
-      return formatError(
-        `IDE bridge call failed: ${(err as Error).message}`,
-        "BRIDGE_ERROR",
-        "Open the .jfr in the IntelliJ Profiler tool window manually, then retry. Or use the flat-aggregate tools (profile_time, profile_frequency).",
-      );
+      bridgeError = summarizeBridgeError((err as Error).message);
     }
   }
 
+  // Only `flat` has a CLI equivalent — the tree modes are bridge-only, so a
+  // bridge failure is terminal for them. Say which of the two happened.
   if (input.mode !== "flat") {
-    return formatError(
-      `profile_call_tree mode '${input.mode}' requires the JetDesk IDE bridge.`,
-      "BRIDGE_REQUIRED",
-      "CLI fallback only supports mode='flat'. Use mode='flat' here, or use profile_time / profile_frequency for raw flat aggregation.",
-    );
+    return bridgeError
+      ? formatError(
+          `profile_call_tree mode '${input.mode}' needs the IDE bridge, and the bridge failed: ${bridgeError}`,
+          "BRIDGE_ERROR",
+          "Retry with mode='flat' (works without the bridge), or use profile_time / profile_frequency.",
+        )
+      : formatError(
+          `profile_call_tree mode '${input.mode}' requires the JetDesk IDE bridge.`,
+          "BRIDGE_REQUIRED",
+          "CLI fallback only supports mode='flat'. Use mode='flat' here, or use profile_time / profile_frequency for raw flat aggregation.",
+        );
   }
 
   try {
     const out = await computeFlatCli(filepath, input.threadFilter, input.topN, input.minPct, input.sortBy);
-    return JSON.stringify({ source: "jfr-cli", snapshot: { file: filepath }, ...out }, null, 2);
+    return JSON.stringify(
+      {
+        source: "jfr-cli",
+        ...(bridgeError ? { degradedFrom: "ide-bridge", bridgeError } : {}),
+        snapshot: { file: filepath },
+        ...out,
+      },
+      null,
+      2,
+    );
   } catch (err) {
     return formatError(
       `jfr CLI failed: ${(err as Error).message}`,
