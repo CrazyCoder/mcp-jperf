@@ -98,21 +98,46 @@ export async function loadBridge(): Promise<LoadResult> {
 let cachedHandle: IdeBridgeHandle | null | undefined;
 
 /**
- * Discover the IDE once per process. Subsequent calls return the cached handle.
+ * Full discovery, honouring the port pin when one is set.
+ *
+ * JETDESK_JAVAPERF_IDE_PORT pins a specific IDE instead of letting the scoring
+ * heuristic pick. Needed when the highest-scoring IDE (usually the monorepo
+ * one) is present but unable to run scripts — otherwise the only way out is to
+ * close that IDE.
+ */
+async function discoverFresh(bridge: IdeBridgeModule): Promise<IdeBridgeHandle | null> {
+  const pinned = Number(process.env.JETDESK_JAVAPERF_IDE_PORT);
+  return Number.isInteger(pinned) && pinned > 0
+    ? bridge.discoverIde({ port: pinned })
+    : bridge.discoverIde({ prefer: "monorepo" });
+}
+
+/**
+ * Discover the IDE once per process, re-probing its identity on every reuse.
+ *
+ * The MCP server outlives the IDE it talks to. A restart keeps the port but
+ * changes what the handle describes — build number, `project_name` keys, the
+ * set of open projects — so a handle cached at first use goes stale silently:
+ * scripts keep running (the port still answers) while every response reports
+ * the pre-restart IDE, and a `project_name` that no longer exists fails the
+ * call outright. Re-probing the known port costs one initialize +
+ * steroid_list_windows, no Kotlin compile, which is noise next to the script
+ * run that follows. When that port stops answering, fall back to full
+ * discovery so a closed IDE fails over instead of failing.
+ *
+ * A cached `null` (no IDE found at all) stays null: re-probing it would add a
+ * discovery timeout to every call on the CLI-fallback path.
+ *
  * Returns null if no bridge library is present, or no reachable IDE is found.
  */
 export async function getIdeBridge(): Promise<{ bridge: IdeBridgeHandle; runner: SnapshotRunnerModule } | null> {
   const loaded = await loadBridge();
   if (!loaded) return null;
   if (cachedHandle === undefined) {
-    // JETDESK_JAVAPERF_IDE_PORT pins a specific IDE instead of letting the
-    // scoring heuristic pick. Needed when the highest-scoring IDE (usually the
-    // monorepo one) is present but unable to run scripts — otherwise the only
-    // way out is to close that IDE.
-    const pinned = Number(process.env.JETDESK_JAVAPERF_IDE_PORT);
-    cachedHandle = Number.isInteger(pinned) && pinned > 0
-      ? await loaded.bridge.discoverIde({ port: pinned })
-      : await loaded.bridge.discoverIde({ prefer: "monorepo" });
+    cachedHandle = await discoverFresh(loaded.bridge);
+  } else if (cachedHandle) {
+    cachedHandle = await loaded.bridge.discoverIde({ port: cachedHandle.port })
+      ?? await discoverFresh(loaded.bridge);
   }
   if (!cachedHandle) return null;
   return { bridge: cachedHandle, runner: loaded.runner };
